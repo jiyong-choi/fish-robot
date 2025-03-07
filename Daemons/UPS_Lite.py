@@ -1,4 +1,5 @@
 # Executed with Python 3.7.3 environment on Raspberry pi zero 2W
+# Make sure I2C is enabled
 
 import struct
 import smbus
