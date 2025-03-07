@@ -1,10 +1,15 @@
 # Executed with Python 3.7.3 environment on Raspberry pi zero 2W
+# In case of Raspberry pi zero series, make sure that UART is enabled and Bluetooth is disabled
+# by adding below commands in /boot/config.txt
+
+# enable_uart=1
+# dtoverlay=disable-bt
 
 import serial
 import threading
 import time
 
-PORT = "/dev/ttyAMA0"
+PORT = "/dev/ttyAMA0" # Check the serial port
 
 class SBUS:
     packet = [0] * 25
