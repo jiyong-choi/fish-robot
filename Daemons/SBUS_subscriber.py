@@ -7,6 +7,8 @@ context = zmq.Context()
 socket = context.socket(zmq.SUB)
 socket.connect("tcp://localhost:5555")
 socket.setsockopt_string(zmq.SUBSCRIBE, "")  # Subscribe to all messages
+print("Starting SBUS subscription...")
+time.sleep(0.5)
 
 def parsePacket(packet):
     channel = [-1] * 18
