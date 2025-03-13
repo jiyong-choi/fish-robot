@@ -57,4 +57,7 @@ while True:
         
         print(f"Channels: {channels}")
 
+    else:
+        print("Turn the Transmitter on and check the Receiver connection!")
+
     time.sleep(0.2)
