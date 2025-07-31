@@ -1,0 +1,17 @@
+# Save this file as /etc/systemd/system/servo_daemon.service
+
+[Unit]
+Description=Servo Daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/bin/python3 /home/pi/Daemons/Servo_daemon.py  # ~/Daemons/Servo_daemon.py
+WorkingDirectory=/home/pi/Daemons
+StandardOutput=inherit
+StandardError=inherit
+Restart=always
+User=pi
+
+[Install]
+WantedBy=multi-user.target
