@@ -6,7 +6,7 @@ import zmq
 import time
 import traceback
 
-PORT = "/dev/ttyAMA0"  # Check the serial port
+PORT = "/dev/ttyAMA0"  # Check the serial port and make sure it is not occupied by Bluetooth
 
 class SBUS:
 
