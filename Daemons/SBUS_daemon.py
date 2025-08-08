@@ -1,4 +1,4 @@
-# Need to install pyzmq using pip3 install pyzmq
+# Need to install pyzmq using apt install python3-zmq or pip3 install pyzmq
 
 import serial
 import threading
