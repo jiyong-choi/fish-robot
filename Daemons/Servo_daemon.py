@@ -20,6 +20,9 @@ import threading
 SERVO_GPIO_PIN_1 = 12   # Servo 1 PWM pin
 SERVO_GPIO_PIN_2 = 13   # Servo 2 PWM pin
 
+SERVO_UPDATE_RATE_1 = 0.01 # How frequent does the servo angle is updated
+SERVO_UPDATE_RATE_2 = 0.01 # seconds
+
 
 def map_2_range(value, old_min=200, old_max=1800, new_min=-10, new_max=10):
     if value < old_min:
@@ -79,12 +82,12 @@ class Servo:
 
         # Servo 1 : Neutral at 1475us, 10deg / 100us
         self.servo1 = AngularServo(SERVO_GPIO_PIN_1, min_angle=-50, max_angle=50, min_pulse_width=0.000975, max_pulse_width=0.001975)
-        self.servo1.source_delay = 0.01
+        self.servo1.source_delay = SERVO_UPDATE_RATE_1
         self.servo1.source = self.sin_values(phase_lag=0)
 
         # Servo 2 : Neutral at 1400us, 10deg / 100us
         self.servo2 = AngularServo(SERVO_GPIO_PIN_2, min_angle=-50, max_angle=50, min_pulse_width=0.0009, max_pulse_width=0.0019)
-        self.servo2.source_delay = 0.01
+        self.servo2.source_delay = SERVO_UPDATE_RATE_2
         self.servo2.source = self.sin_values(phase_lag=0) # Set the phase lag
 
         self.context = zmq.Context()
@@ -143,16 +146,15 @@ class Servo:
                     if channels[0] != 0:
                         self.channels = channels_2_dir(channels)
                         #print(self.channels[2])
-                        if self.channels[2] > 0:
-                            if self.latest_packet is not None:
-                                self.A = self.latest_packet[0]
-                                self.B = self.latest_packet[1]
-                                sleep(0.01)
-                                #print(f"updated value to {self.A}, {self.B}")
+                        if self.channels[2] > 0 and self.latest_packet is not None:
+                            self.A = self.latest_packet[0]
+                            self.B = self.latest_packet[1]
+                            #print(f"updated value to {self.A}, {self.B}")
                         else:
                             self.A = self.channels[0]/20
                             self.B = self.channels[1]/20
-                            sleep(0.01)
+            
+            sleep(0.01)
 
     def start(self):
         self.thread.start()
@@ -166,8 +168,6 @@ class Servo:
         
         for angle in cycle(angles):
             yield max(-0.99, min(self.A*sin(angle - phase_lag) - self.B, 0.99))
-
-
 
 
 ##### End #####
