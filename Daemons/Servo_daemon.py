@@ -96,7 +96,7 @@ class ServoTarget:
             return self.A, self.B
 
 class ROS_Subscriber_Bringup:
-    def __init__(self, shared_targets: ServoTarget, node_name="servo_subscriber"):
+    def __init__(self, shared_targets: ServoTarget, node_name="Servo_subscriber"):
         self.node_name = node_name
         self.shared = shared_targets
         self.ready = threading.Event()
@@ -124,8 +124,8 @@ class ROS_Subscriber_Bringup:
                     if not rospy.core.is_initialized():
                         raise RuntimeError("rospy not initialized after init_node")
 
-                    sub = rospy.Subscriber("/servo/cmd", Float32MultiArray, self._cmd_callback, queue_size=10)
-                    rospy.loginfo("ROS is up. Subscribed to /servo/cmd (std_msgs/Float32MultiArray).")
+                    sub = rospy.Subscriber("/cmd/servo", Float32MultiArray, self._cmd_callback, queue_size=10)
+                    rospy.loginfo("ROS is up. Subscribed to /cmd/servo (std_msgs/Float32MultiArray).")
 
                     # Keep this thread alive for callbacks
                     while not rospy.is_shutdown():
