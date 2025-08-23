@@ -6,7 +6,7 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-ExecStart=/usr/bin/python3 /home/pi/Daemons/Servo_daemon.py  # ~/Daemons/Servo_daemon.py
+ExecStart=/bin/bash -c 'source /opt/ros/noetic/setup.bash && /usr/bin/python3 /home/pi/Daemons/Servo_daemon.py'
 WorkingDirectory=/home/pi/Daemons
 StandardOutput=inherit
 StandardError=inherit
