@@ -3,13 +3,10 @@
 # Set Pin Factory to pigpio https://gpiozero.readthedocs.io/en/stable/api_pins.html#changing-the-pin-factory
 from gpiozero.pins.pigpio import PiGPIOFactory
 from gpiozero import Device, AngularServo
-from gpiozero.tools import scaled
-from signal import pause
 
 Device.pin_factory = PiGPIOFactory()
 
 ##### Taken from gpiozero source #####
-from random import random
 from time import sleep
 from itertools import cycle
 from math import sin, cos, pi, isclose
@@ -17,17 +14,19 @@ from statistics import mean
 
 import rosgraph
 import rospy
-from std_msgs.msg import Float32MultiArray
+from std_msgs.msg import Float64MultiArray
 
 import zmq
 import threading
 
 
+SERVO_GPIO_PIN_0 = 17   # Front servo pin
 SERVO_GPIO_PIN_1 = 12   # Servo 1 PWM pin
 SERVO_GPIO_PIN_2 = 13   # Servo 2 PWM pin
 
-SERVO_UPDATE_RATE_1 = 0.01 # How frequent does the servo angle is updated
-SERVO_UPDATE_RATE_2 = 0.01 # seconds
+SERVO_UPDATE_RATE_0 = 1 # How frequent does the servo angle is updated
+SERVO_UPDATE_RATE_1 = 0.01 # seconds
+SERVO_UPDATE_RATE_2 = 0.01
 
 
 def map_2_range(value, old_min=200, old_max=1800, new_min=-10, new_max=10):
@@ -103,11 +102,12 @@ class ROS_Subscriber_Bringup:
         self._thread = threading.Thread(target=self._wait_and_init, daemon=True)
         self._thread.start()
 
-    def _cmd_callback(self, msg: Float32MultiArray):
+    def _cmd_callback(self, msg: Float64MultiArray):
         # Update the shared object from ROS callback
         if not msg.data:
             print("No Msg Data")
             return
+        
         print("Set shared data")
         self.shared.set_AB(msg.data)
 
@@ -124,8 +124,8 @@ class ROS_Subscriber_Bringup:
                     if not rospy.core.is_initialized():
                         raise RuntimeError("rospy not initialized after init_node")
 
-                    sub = rospy.Subscriber("/cmd/servo", Float32MultiArray, self._cmd_callback, queue_size=10)
-                    rospy.loginfo("ROS is up. Subscribed to /cmd/servo (std_msgs/Float32MultiArray).")
+                    sub = rospy.Subscriber("/cmd/servo", Float64MultiArray, self._cmd_callback, queue_size=10)
+                    rospy.loginfo("ROS is up. Subscribed to /cmd/servo (std_msgs/Float64MultiArray).")
 
                     # Keep this thread alive for callbacks
                     while not rospy.is_shutdown():
@@ -145,6 +145,11 @@ class Servo:
         self.A = 0
         self.B = 0
         self.period = 40
+
+        # Servo 0 (Front servo) : Neutral at 1500us
+        self.servo0 = AngularServo(SERVO_GPIO_PIN_0, min_angle=-50, max_angle=50, min_pulse_width=0.001, max_pulse_width=0.002)
+        self.servo0.source_delay = SERVO_UPDATE_RATE_0
+        self.servo0.source = self.bladder_values()
 
         # Servo 1 : Neutral at 1475us, 10deg / 100us
         self.servo1 = AngularServo(SERVO_GPIO_PIN_1, min_angle=-50, max_angle=50, min_pulse_width=0.000975, max_pulse_width=0.001975)
@@ -237,6 +242,13 @@ class Servo:
         
         for angle in cycle(angles):
             yield max(-0.99, min(self.A*sin(angle - phase_lag) - self.B, 0.99))
+    
+    def bladder_values(self):
+        while True:
+            for ang in range(-100, 101, 20):
+                yield 0.5 * ang / 100.0
+            for ang in range(100, -101, -10):
+                yield 0.5 * ang / 100.0
 
 
 ##### End #####
