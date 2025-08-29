@@ -2,14 +2,14 @@
 
 # Set Pin Factory to pigpio https://gpiozero.readthedocs.io/en/stable/api_pins.html#changing-the-pin-factory
 from gpiozero.pins.pigpio import PiGPIOFactory
-from gpiozero import Device, AngularServo
+from gpiozero import Device, OutputDevice, AngularServo
 
 Device.pin_factory = PiGPIOFactory()
 
 ##### Taken from gpiozero source #####
-from time import sleep
+from time import sleep, monotonic
 from itertools import cycle
-from math import sin, cos, pi, isclose
+from math import sin, cos, pi, isclose, degrees
 from statistics import mean
 
 import rosgraph
@@ -20,13 +20,21 @@ import zmq
 import threading
 
 
+SERVOS_POWER_PIN = 27   # Power switch pin
 SERVO_GPIO_PIN_0 = 17   # Front servo pin
 SERVO_GPIO_PIN_1 = 12   # Servo 1 PWM pin
 SERVO_GPIO_PIN_2 = 13   # Servo 2 PWM pin
 
-SERVO_UPDATE_RATE_0 = 1 # How frequent does the servo angle is updated
+SERVO_UPDATE_RATE_0 = 0.01 # How frequent does the servo angle is updated
 SERVO_UPDATE_RATE_1 = 0.01 # seconds
 SERVO_UPDATE_RATE_2 = 0.01
+
+BLADDER_NEUTRAL_POSITION = 0 # Between -10 and 10
+BLADDER_CONTROL_GAIN = [0.5, 0, 0.01] # P, I, D gain
+
+TAIL_SERVO_PERIOD = 40
+
+Servos_power_switch = OutputDevice(SERVOS_POWER_PIN)
 
 
 def map_2_range(value, old_min=200, old_max=1800, new_min=-10, new_max=10):
@@ -45,10 +53,9 @@ def channels_2_dir(old_channels):
     RightVert = channels[1]
     RightHori = channels[0]
     LeftSwitch = channels[6]
-    #print(f"LeftVert={LeftVert}, LeftHori={LeftHori}")
-    #print(f"RightVert={RightVert}, RightHori={RightHori}")
-    #print(f"SwitchOn={LeftSwitch}")
-    return LeftVert, RightHori, LeftSwitch
+    RightSwitch = channels[4]
+    RightDial = channels[5]
+    return LeftVert, RightHori, LeftSwitch, RightSwitch, RightDial
     
 # Parse packet into coherent 'channel' list
 def parsePacket(packet):
@@ -83,16 +90,28 @@ class ServoTarget:
         self._lock = threading.Lock()
         self.A = 0.0
         self.B = 0.0
+        self.pitch = 0.0
 
     def set_AB(self, arr):
         with self._lock:
             if len(arr) >= 1: self.A = float(arr[0])
             if len(arr) >= 2: self.B = float(arr[1])
-        #print(f"Shared set to {self.A} and {self.B}")
 
     def get_AB(self):
         with self._lock:
             return self.A, self.B
+
+    def set_state(self, arr):
+        # arr: [x, y, z, roll, pitch, yaw]
+        if not arr or len(arr) != 6:
+            return
+        with self._lock:
+            self.pitch = float(arr[4])
+
+    def get_pitch(self):
+        with self._lock:
+            return self.pitch
+
 
 class ROS_Subscriber_Bringup:
     def __init__(self, shared_targets: ServoTarget, node_name="Servo_subscriber"):
@@ -103,13 +122,18 @@ class ROS_Subscriber_Bringup:
         self._thread.start()
 
     def _cmd_callback(self, msg: Float64MultiArray):
-        # Update the shared object from ROS callback
         if not msg.data:
-            print("No Msg Data")
+            print("No Msg Data (/cmd/servo)")
             return
         
-        print("Set shared data")
         self.shared.set_AB(msg.data)
+
+    def _state_callback(self, msg: Float64MultiArray):
+        if not msg.data:
+            print("No Msg Data (/Fish_state)")
+            return
+        
+        self.shared.set_state(msg.data)
 
     def _wait_and_init(self):
         backoff = 2
@@ -117,24 +141,21 @@ class ROS_Subscriber_Bringup:
             while not rospy.core.is_shutdown():
                 try:
                     print("ROS initializing...")
-                    # If you're in a worker thread, disable signal handlers:
                     rospy.init_node(self.node_name, anonymous=True, disable_signals=True)
 
-                    # Double-check that rospy thinks it's initialized
                     if not rospy.core.is_initialized():
                         raise RuntimeError("rospy not initialized after init_node")
 
-                    sub = rospy.Subscriber("/cmd/servo", Float64MultiArray, self._cmd_callback, queue_size=10)
-                    rospy.loginfo("ROS is up. Subscribed to /cmd/servo (std_msgs/Float64MultiArray).")
+                    sub_cmd = rospy.Subscriber("/cmd/servo", Float64MultiArray, self._cmd_callback, queue_size=10)
+                    sub_state = rospy.Subscriber("/Fish_state", Float64MultiArray, self._state_callback, queue_size=10)
+                    rospy.loginfo("ROS is up. Subscribed to /cmd/servo and /Fish_state (std_msgs/Float64MultiArray).")
 
-                    # Keep this thread alive for callbacks
                     while not rospy.is_shutdown():
                         sleep(0.1)
                     return
-
                 except Exception as e:
                     print(f"ROS initialization failed, retrying: {e}")
-            sleep(1.0)  # small backoff before retry
+            sleep(1.0)
             print("ROScore Not found")
             sleep(backoff)
 
@@ -144,12 +165,15 @@ class Servo:
     def __init__(self, shared_targets: ServoTarget):
         self.A = 0
         self.B = 0
-        self.period = 40
+        self.bladder = BLADDER_NEUTRAL_POSITION
+        self.K_p, self.K_i, self.K_d = BLADDER_CONTROL_GAIN
+        self.period = TAIL_SERVO_PERIOD
 
         # Servo 0 (Front servo) : Neutral at 1500us
         self.servo0 = AngularServo(SERVO_GPIO_PIN_0, min_angle=-50, max_angle=50, min_pulse_width=0.001, max_pulse_width=0.002)
         self.servo0.source_delay = SERVO_UPDATE_RATE_0
-        self.servo0.source = self.bladder_values()
+        # self.servo0.source = self.bladder_test()  # OLD
+        self.servo0.source = self.bladder_values()       # NEW: follow pitch
 
         # Servo 1 : Neutral at 1475us, 10deg / 100us
         self.servo1 = AngularServo(SERVO_GPIO_PIN_1, min_angle=-50, max_angle=50, min_pulse_width=0.000975, max_pulse_width=0.001975)
@@ -162,11 +186,7 @@ class Servo:
         self.servo2.source = self.sin_values(phase_lag=0) # Set the phase lag
 
         self.context = zmq.Context()
-        #self.socket = self.context.socket(zmq.SUB)
-        #self.socket.connect("tcp://localhost:7777")
-        #self.socket.setsockopt_string(zmq.SUBSCRIBE, "")  # Subscribe to all messages
         self.shared = shared_targets
-        #self.latest_packet = shared_targets.get_AB()
 
         self.rf_socket = self.context.socket(zmq.SUB)
         self.rf_socket.connect("tcp://localhost:5555")
@@ -179,55 +199,48 @@ class Servo:
         self.thread = threading.Thread(target=self.update, daemon=True)
 
         self.channels = None
+
+        self.last_pitch_error = 0.0
+        self.last_time = None
         
 
     def update(self):
-
         while self.running:
-            #while True:
-            #    try:
-            #        self.latest_packet = self.socket.recv_pyobj(flags=zmq.NOBLOCK)
-            #    except zmq.Again:
-            #        #print("This is Again")
-            #        break
-
             while True:
                 try:
                     self.latest_rfpacket = self.rf_socket.recv_pyobj(flags=zmq.NOBLOCK)
                 except zmq.Again:
-                    #print("This is Again2")
                     break
-            #print("new try")
-            #print(self.latest_packet) # this works
-            #print(self.latest_rfpacket) # Not this.
 
             if self.latest_rfpacket is not None:
-                #print(self.latest_rfpacket)
                 channels, frame_lost, failsafe = parsePacket(self.latest_rfpacket)
-                #print("Trasmit input")
-                if failsafe:
-                    #print("Transmitter Connection LOST - Failsafe Activated!")
+                if failsafe and Servos_power_switch.is_active: Servos_power_switch.off()
+                if failsafe or frame_lost:
+                    print("Transmitter Connection LOST - Failsafe Activated!")
                     self.A = 0
                     self.B = 0
-                elif frame_lost:
-                    #print("Transmitter Connection unstable - Frame Lost detected!")
-                    self.A = 0
-                    self.B = 0
+                    self.bladder = BLADDER_NEUTRAL_POSITION
                 else:
-                    #print("Transmitter Connected")
                     if channels[0] != 0:
+                        if not Servos_power_switch.is_active: Servos_power_switch.on()
+                        #print("Transmitter Connected")
                         self.channels = channels_2_dir(channels)
-                        #print(self.channels[2])
                         if self.channels[2] > 0:
-                            #self.A = self.latest_packet[0]
-                            #self.B = self.latest_packet[1]
                             self.A, self.B = self.shared.get_AB()
                         else:
                             self.A = self.channels[0]/20
                             self.B = self.channels[1]/20
                         
-                        #print(f"Updated value to A: {self.A}, B:{self.B}")
-            
+                        if self.channels[3] > 0:
+                            self.bladder = self.pitch_control()
+                            print(f'Auto control mode: Bladder {self.bladder}')
+                        elif self.channels[3] == 0:
+                            self.bladder = BLADDER_NEUTRAL_POSITION
+                            print(f'Neutral mode: Bladder {self.bladder}')
+                        else:
+                            self.bladder = self.channels[4]
+                            print(f'Manual control mode: Bladder {self.bladder}')
+
             sleep(0.01)
 
     def start(self):
@@ -239,16 +252,44 @@ class Servo:
 
     def sin_values(self, phase_lag):
         angles = (2 * pi * i / self.period for i in range(self.period))
-        
         for angle in cycle(angles):
             yield max(-0.99, min(self.A*sin(angle - phase_lag) - self.B, 0.99))
     
     def bladder_values(self):
         while True:
-            for ang in range(-100, 101, 20):
-                yield 0.5 * ang / 100.0
-            for ang in range(100, -101, -10):
-                yield 0.5 * ang / 100.0
+            self.bladder = max(-10, min(self.bladder, 10))
+            yield 0.6 * self.bladder / 10.0
+
+    # (Optional) keep your original sweep around for testing
+    def bladder_test(self):
+        while True:
+            for ang in range(-100, 101, 1):
+                yield 0.6 * ang / 100.0
+            for ang in range(100, -101, -1):
+                yield 0.6 * ang / 100.0
+
+    def pitch_control(self):
+        pitch = self.shared.get_pitch()
+
+        # PD control to drive pitch to 0 deg
+        error = -pitch
+        now = monotonic()
+
+        if self.last_time is None:
+            dt = 0.0
+            d_error = 0.0
+        else:
+            # protect against zero / negative dt
+            dt = max(now - self.last_time, 0)
+            d_error = (error - self.last_pitch_error) / dt if dt > 0 else 0.0
+
+        u = BLADDER_NEUTRAL_POSITION - (self.K_p * error) - (self.K_d * d_error)
+
+        # remember for next step
+        self.last_pitch_error = error
+        self.last_time = now
+
+        return u
 
 
 ##### End #####
