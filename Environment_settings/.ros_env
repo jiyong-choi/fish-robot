@@ -1,0 +1,10 @@
+# ~/.ros_env
+
+
+# ROS Master configuration
+
+# When running ROScore on this PC
+# ROS_MASTER_IP=$(hostname -I | awk '{print $1}')
+
+# When connecting to a ROScore running on other PC
+ROS_MASTER_IP=192.168.0.8
