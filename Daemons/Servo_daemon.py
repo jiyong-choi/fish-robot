@@ -257,8 +257,8 @@ class Servo:
     
     def bladder_values(self):
         while True:
-            self.bladder = max(-10, min(self.bladder, 10))
-            yield 0.6 * self.bladder / 10.0
+            bladder = max(-10, min(self.bladder, 10))
+            yield 0.6 * bladder / 10.0
 
     # (Optional) keep your original sweep around for testing
     def bladder_test(self):
@@ -289,7 +289,7 @@ class Servo:
         self.last_pitch_error = error
         self.last_time = now
 
-        return u
+        return round(u, 1)
 
 
 ##### End #####
