@@ -23,14 +23,14 @@ SERVO_GPIO_PIN_0 = 17   # Front servo pin
 SERVO_GPIO_PIN_1 = 12   # Servo 1 PWM pin
 SERVO_GPIO_PIN_2 = 13   # Servo 2 PWM pin
 
-SERVO_UPDATE_RATE = 0.1 # How frequent does the servo angle is updated (seconds)
+SERVO_UPDATE_RATE = 0.05 # How frequent does the servo angle is updated (seconds)
 RF_UPDATE_RATE = 0.01
 
 BLADDER_NEUTRAL_POSITION = 0.0 # Between -10 and 10
 BLADDER_CONTROL_GAIN = [0.2, 0.0, 0.1] # P, I, D gain
 TARGET_PITCH = 0.0
 
-TAIL_SERVO_PERIOD = 5
+TAIL_SERVO_PERIOD = 10
 FISH_STATE_TIMEOUT_SEC = 0.2  # /Fish_state가 이 시간 이상 끊기면 /Fish_data 중단
 
 Servos_power_switch = OutputDevice(SERVOS_POWER_PIN)
@@ -269,8 +269,12 @@ class Servo:
                         # print("Transmitter Connected")
                         self.channels = channels_2_dir(channels)
                         if self.channels[2] > 0:
-                            self.A, self.B = self.shared.get_AB()
+                            # self.A, self.B = self.shared.get_AB()
+                            # self.shared.set_mode('PC')
+                            self.A = self.channels[0]/20
+                            self.B = self.channels[1]/20
                             self.shared.set_mode('PC')
+                            self.shared.set_AB([self.A, self.B]) # 여기 조심!!!!!!!!!!!!!!!!! Logging을 위한 PC mode 개조
                         else:
                             self.A = self.channels[0]/20
                             self.B = self.channels[1]/20
@@ -297,8 +301,8 @@ class Servo:
         next_tick = monotonic()
         while self.running:
             next_tick += SERVO_UPDATE_RATE
-
-            self.shared.publish_data()
+            if self.shared.get_mode() == 'PC':
+                self.shared.publish_data()
             self.servo0.value = next(self.servo0_CPG)
             self.servo1.value = next(self.servo1_CPG)
             self.servo2.value = next(self.servo2_CPG)
