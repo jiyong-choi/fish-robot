@@ -216,12 +216,15 @@ class Servo:
 
         # Servo 0 (Front servo) : Neutral at 1500us
         self.servo0 = AngularServo(SERVO_GPIO_PIN_0, min_angle=-50, max_angle=50, min_pulse_width=0.001, max_pulse_width=0.002)
+        self.servo0_CPG = self.bladder_values()
 
         # Servo 1 : Neutral at 1475us, 10deg / 100us
         self.servo1 = AngularServo(SERVO_GPIO_PIN_1, min_angle=-50, max_angle=50, min_pulse_width=0.000975, max_pulse_width=0.001975)
+        self.servo1_CPG = self.sin_values(phase_lag=0)
 
         # Servo 2 : Neutral at 1400us, 10deg / 100us
         self.servo2 = AngularServo(SERVO_GPIO_PIN_2, min_angle=-50, max_angle=50, min_pulse_width=0.0009, max_pulse_width=0.0019)
+        self.servo2_CPG = self.sin_values(phase_lag=0)
 
         self.context = zmq.Context()
         self.rf_socket = self.context.socket(zmq.SUB)
@@ -241,8 +244,9 @@ class Servo:
         self.last_time = None
 
     def update_command(self):
+        next_tick = monotonic()
         while self.running:
-            starttime = monotonic()
+            next_tick += RF_UPDATE_RATE
             while True:
                 try:
                     self.latest_rfpacket = self.rf_socket.recv_pyobj(flags=zmq.NOBLOCK)
@@ -283,20 +287,27 @@ class Servo:
                             self.bladder = self.channels[4]
                             # print(f'Manual control mode: Bladder {self.bladder}')
 
-            while monotonic() - starttime < RF_UPDATE_RATE:
-                pass
+            sleep_time = next_tick - monotonic()
+            if sleep_time > 0:
+                sleep(sleep_time)
+            else:
+                next_tick = monotonic()
 
     def update_servo(self):
+        next_tick = monotonic()
         while self.running:
-            starttime = monotonic()
+            next_tick += SERVO_UPDATE_RATE
 
             self.shared.publish_data()
-            self.servo0.value = next(self.bladder_values())
-            self.servo1.value = next(self.sin_values(phase_lag=0))
-            self.servo2.value = next(self.sin_values(phase_lag=0))
+            self.servo0.value = next(self.servo0_CPG)
+            self.servo1.value = next(self.servo1_CPG)
+            self.servo2.value = next(self.servo2_CPG)
 
-            while monotonic() - starttime < SERVO_UPDATE_RATE:
-                pass
+            sleep_time = next_tick - monotonic()
+            if sleep_time > 0:
+                sleep(sleep_time)
+            else:
+                next_tick = monotonic()
 
     def start(self):
         self.rf_thread.start()
