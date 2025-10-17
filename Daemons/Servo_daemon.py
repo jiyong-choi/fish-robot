@@ -9,10 +9,8 @@ Device.pin_factory = PiGPIOFactory()
 ##### Taken from gpiozero source #####
 from time import sleep, monotonic
 from itertools import cycle
-from math import sin, cos, pi, isclose, degrees
-from statistics import mean
+from math import sin, cos, pi
 
-import rosgraph
 import rospy
 from std_msgs.msg import Float64MultiArray
 
@@ -25,14 +23,15 @@ SERVO_GPIO_PIN_0 = 17   # Front servo pin
 SERVO_GPIO_PIN_1 = 12   # Servo 1 PWM pin
 SERVO_GPIO_PIN_2 = 13   # Servo 2 PWM pin
 
-SERVO_UPDATE_RATE_0 = 0.01 # How frequent does the servo angle is updated
-SERVO_UPDATE_RATE_1 = 0.01 # seconds
-SERVO_UPDATE_RATE_2 = 0.01
+SERVO_UPDATE_RATE = 0.1 # How frequent does the servo angle is updated (seconds)
+RF_UPDATE_RATE = 0.01
 
-BLADDER_NEUTRAL_POSITION = 0 # Between -10 and 10
-BLADDER_CONTROL_GAIN = [0.5, 0, 0.01] # P, I, D gain
+BLADDER_NEUTRAL_POSITION = 0.0 # Between -10 and 10
+BLADDER_CONTROL_GAIN = [0.2, 0.0, 0.1] # P, I, D gain
+TARGET_PITCH = 0.0
 
-TAIL_SERVO_PERIOD = 40
+TAIL_SERVO_PERIOD = 5
+FISH_STATE_TIMEOUT_SEC = 0.2  # /Fish_state가 이 시간 이상 끊기면 /Fish_data 중단
 
 Servos_power_switch = OutputDevice(SERVOS_POWER_PIN)
 
@@ -91,6 +90,10 @@ class ServoTarget:
         self.A = 0.0
         self.B = 0.0
         self.pitch = 0.0
+        self.state = [0.0]*6
+        self.mode = None
+        self.pub_data = None
+        self._last_state_walltime = None
 
     def set_AB(self, arr):
         with self._lock:
@@ -106,14 +109,53 @@ class ServoTarget:
         if not arr or len(arr) != 6:
             return
         with self._lock:
+            self.state = list(arr)
             self.pitch = float(arr[4])
+            self._last_state_walltime = monotonic()
+    
+    def get_state(self):
+        with self._lock:
+            return self.state
+    
+    def _state_is_fresh(self, timeout=FISH_STATE_TIMEOUT_SEC):
+        t = self._last_state_walltime
+        return (t is not None) and ((monotonic() - t) <= timeout)
 
     def get_pitch(self):
         with self._lock:
             return self.pitch
+    
+    def set_mode(self, mode):
+        with self._lock:
+            self.mode = mode
+    
+    def get_mode(self):
+        with self._lock:
+            return self.mode
+    
+    def publish_data(self):
+        if self.pub_data is None:
+            return
+        
+        if self._state_is_fresh():
+            A, B = self.get_AB()
+            mode = self.get_mode()
+
+            # RC=1.0, PC=0.0, Failsafe=-1.0
+            if mode == 'RC':
+                mode_val = 1.0
+            elif mode == 'PC':
+                mode_val = 0.0
+            else:
+                mode_val = -1.0
+            
+            msg = Float64MultiArray()
+            msg.data = [rospy.get_time()] + self.get_state() + [A, B, mode_val]
+
+            self.pub_data.publish(msg)
 
 
-class ROS_Subscriber_Bringup:
+class ROS_Bringup:
     def __init__(self, shared_targets: ServoTarget, node_name="Servo_subscriber"):
         self.node_name = node_name
         self.shared = shared_targets
@@ -148,6 +190,8 @@ class ROS_Subscriber_Bringup:
 
                     sub_cmd = rospy.Subscriber("/cmd/servo", Float64MultiArray, self._cmd_callback, queue_size=10)
                     sub_state = rospy.Subscriber("/Fish_state", Float64MultiArray, self._state_callback, queue_size=10)
+                    pub_data = rospy.Publisher("/Fish_data", Float64MultiArray, queue_size=10)
+                    self.shared.pub_data = pub_data
                     rospy.loginfo("ROS is up. Subscribed to /cmd/servo and /Fish_state (std_msgs/Float64MultiArray).")
 
                     while not rospy.is_shutdown():
@@ -161,7 +205,6 @@ class ROS_Subscriber_Bringup:
 
 
 class Servo:
-
     def __init__(self, shared_targets: ServoTarget):
         self.A = 0
         self.B = 0
@@ -169,25 +212,18 @@ class Servo:
         self.K_p, self.K_i, self.K_d = BLADDER_CONTROL_GAIN
         self.period = TAIL_SERVO_PERIOD
 
+        self.shared = shared_targets
+
         # Servo 0 (Front servo) : Neutral at 1500us
         self.servo0 = AngularServo(SERVO_GPIO_PIN_0, min_angle=-50, max_angle=50, min_pulse_width=0.001, max_pulse_width=0.002)
-        self.servo0.source_delay = SERVO_UPDATE_RATE_0
-        # self.servo0.source = self.bladder_test()  # OLD
-        self.servo0.source = self.bladder_values()       # NEW: follow pitch
 
         # Servo 1 : Neutral at 1475us, 10deg / 100us
         self.servo1 = AngularServo(SERVO_GPIO_PIN_1, min_angle=-50, max_angle=50, min_pulse_width=0.000975, max_pulse_width=0.001975)
-        self.servo1.source_delay = SERVO_UPDATE_RATE_1
-        self.servo1.source = self.sin_values(phase_lag=0)
 
         # Servo 2 : Neutral at 1400us, 10deg / 100us
         self.servo2 = AngularServo(SERVO_GPIO_PIN_2, min_angle=-50, max_angle=50, min_pulse_width=0.0009, max_pulse_width=0.0019)
-        self.servo2.source_delay = SERVO_UPDATE_RATE_2
-        self.servo2.source = self.sin_values(phase_lag=0) # Set the phase lag
 
         self.context = zmq.Context()
-        self.shared = shared_targets
-
         self.rf_socket = self.context.socket(zmq.SUB)
         self.rf_socket.connect("tcp://localhost:5555")
         self.rf_socket.setsockopt_string(zmq.SUBSCRIBE, "")
@@ -196,16 +232,17 @@ class Servo:
         sleep(0.5)
 
         self.running = True
-        self.thread = threading.Thread(target=self.update, daemon=True)
+        self.rf_thread = threading.Thread(target=self.update_command, daemon=True)
+        self.servo_thread = threading.Thread(target=self.update_servo, daemon=True)
 
         self.channels = None
 
         self.last_pitch_error = 0.0
         self.last_time = None
-        
 
-    def update(self):
+    def update_command(self):
         while self.running:
+            starttime = monotonic()
             while True:
                 try:
                     self.latest_rfpacket = self.rf_socket.recv_pyobj(flags=zmq.NOBLOCK)
@@ -216,39 +253,59 @@ class Servo:
                 channels, frame_lost, failsafe = parsePacket(self.latest_rfpacket)
                 if failsafe and Servos_power_switch.is_active: Servos_power_switch.off()
                 if failsafe or frame_lost:
-                    print("Transmitter Connection LOST - Failsafe Activated!")
+                    # print("Transmitter Connection LOST - Failsafe Activated!")
                     self.A = 0
                     self.B = 0
+                    self.shared.set_AB([self.A, self.B])
                     self.bladder = BLADDER_NEUTRAL_POSITION
+                    self.shared.set_mode(None)
                 else:
                     if channels[0] != 0:
                         if not Servos_power_switch.is_active: Servos_power_switch.on()
-                        #print("Transmitter Connected")
+                        # print("Transmitter Connected")
                         self.channels = channels_2_dir(channels)
                         if self.channels[2] > 0:
                             self.A, self.B = self.shared.get_AB()
+                            self.shared.set_mode('PC')
                         else:
                             self.A = self.channels[0]/20
                             self.B = self.channels[1]/20
+                            self.shared.set_mode('RC')
+                            self.shared.set_AB([self.A, self.B])
                         
                         if self.channels[3] > 0:
                             self.bladder = self.pitch_control()
-                            print(f'Auto control mode: Bladder {self.bladder}')
+                            # print(f'Auto control mode: Bladder {self.bladder}')
                         elif self.channels[3] == 0:
                             self.bladder = BLADDER_NEUTRAL_POSITION
-                            print(f'Neutral mode: Bladder {self.bladder}')
+                            # print(f'Neutral mode: Bladder {self.bladder}')
                         else:
                             self.bladder = self.channels[4]
-                            print(f'Manual control mode: Bladder {self.bladder}')
+                            # print(f'Manual control mode: Bladder {self.bladder}')
 
-            sleep(0.01)
+            while monotonic() - starttime < RF_UPDATE_RATE:
+                pass
+
+    def update_servo(self):
+        while self.running:
+            starttime = monotonic()
+
+            self.shared.publish_data()
+            self.servo0.value = next(self.bladder_values())
+            self.servo1.value = next(self.sin_values(phase_lag=0))
+            self.servo2.value = next(self.sin_values(phase_lag=0))
+
+            while monotonic() - starttime < SERVO_UPDATE_RATE:
+                pass
 
     def start(self):
-        self.thread.start()
+        self.rf_thread.start()
+        self.servo_thread.start()
 
     def stop(self):
         self.running = False
-        self.thread.join()
+        self.rf_thread.join()
+        self.servo_thread.join()
 
     def sin_values(self, phase_lag):
         angles = (2 * pi * i / self.period for i in range(self.period))
@@ -290,11 +347,12 @@ class Servo:
         self.last_time = now
 
         return round(u, 1)
+    
 
 
 ##### End #####
 target = ServoTarget()
-ros = ROS_Subscriber_Bringup(target)
+ros = ROS_Bringup(target)
 
 servo = Servo(target)
 servo.start()
