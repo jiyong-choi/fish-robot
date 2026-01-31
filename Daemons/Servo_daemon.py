@@ -30,7 +30,7 @@ BLADDER_NEUTRAL_POSITION = 0.0 # Between -10 and 10
 BLADDER_CONTROL_GAIN = [0.2, 0.0, 0.1] # P, I, D gain
 TARGET_PITCH = 0.0
 
-TAIL_SERVO_PERIOD = 10
+TAIL_SERVO_PERIOD = 8
 FISH_STATE_TIMEOUT_SEC = 0.2  # /Fish_state가 이 시간 이상 끊기면 /Fish_data 중단
 
 Servos_power_switch = OutputDevice(SERVOS_POWER_PIN)
