@@ -32,6 +32,7 @@ TARGET_PITCH = 0.0
 
 TAIL_SERVO_PERIOD = 8
 FISH_STATE_TIMEOUT_SEC = 0.2  # /Fish_state가 이 시간 이상 끊기면 /Fish_data 중단
+PC_CONTROL_UPDATE_INTERVAL = 1.0
 
 Servos_power_switch = OutputDevice(SERVOS_POWER_PIN)
 
@@ -87,22 +88,37 @@ def parsePacket(packet):
 class ServoTarget:
     def __init__(self):
         self._lock = threading.Lock()
-        self.A = 0.0
-        self.B = 0.0
+        # Command from the RC controller
+        self.cmd_A = 0.0
+        self.cmd_B = 0.0
+
+        # Actual applied to the servo
+        self.applied_A = 0.0
+        self.applied_B = 0.0
+
         self.pitch = 0.0
         self.state = [0.0]*6
         self.mode = None
         self.pub_data = None
         self._last_state_walltime = None
 
-    def set_AB(self, arr):
+    def set_cmd_AB(self, arr):
         with self._lock:
-            if len(arr) >= 1: self.A = float(arr[0])
-            if len(arr) >= 2: self.B = float(arr[1])
+            if len(arr) >= 1: self.cmd_A = float(arr[0])
+            if len(arr) >= 2: self.cmd_B = float(arr[1])
 
-    def get_AB(self):
+    def get_cmd_AB(self):
         with self._lock:
-            return self.A, self.B
+            return self.cmd_A, self.cmd_B
+    
+    def set_applied_AB(self, A, B):
+        with self._lock:
+            self.applied_A = float(A)
+            self.applied_B = float(B)
+
+    def get_applied_AB(self):
+        with self._lock:
+            return self.applied_A, self.applied_B
 
     def set_state(self, arr):
         # arr: [x, y, z, roll, pitch, yaw]
@@ -137,22 +153,27 @@ class ServoTarget:
         if self.pub_data is None:
             return
         
-        if self._state_is_fresh():
-            A, B = self.get_AB()
-            mode = self.get_mode()
+        if not self._state_is_fresh():
+            return
 
-            # RC=1.0, PC=0.0, Failsafe=-1.0
-            if mode == 'RC':
-                mode_val = 1.0
-            elif mode == 'PC':
-                mode_val = 0.0
-            else:
-                mode_val = -1.0
-            
-            msg = Float64MultiArray()
-            msg.data = [rospy.get_time()] + self.get_state() + [A, B, mode_val]
+        with self._lock:
+            A = self.applied_A
+            B = self.applied_B
+            mode = self.mode
+            state = self.state
+        
+        # RC=1.0, PC=0.0, Failsafe=-1.0
+        if mode == 'RC':
+            mode_val = 1.0
+        elif mode == 'PC':
+            mode_val = 0.0
+        else:
+            mode_val = -1.0
+        
+        msg = Float64MultiArray()
+        msg.data = [rospy.get_time()] + state + [A, B, mode_val]
 
-            self.pub_data.publish(msg)
+        self.pub_data.publish(msg)
 
 
 class ROS_Bringup:
@@ -168,7 +189,7 @@ class ROS_Bringup:
             print("No Msg Data (/cmd/servo)")
             return
         
-        self.shared.set_AB(msg.data)
+        self.shared.set_cmd_AB(msg.data)
 
     def _state_callback(self, msg: Float64MultiArray):
         if not msg.data:
@@ -242,6 +263,7 @@ class Servo:
 
         self.last_pitch_error = 0.0
         self.last_time = None
+        self.last_pc_apply_time = None
 
     def update_command(self):
         next_tick = monotonic()
@@ -260,27 +282,36 @@ class Servo:
                     # print("Transmitter Connection LOST - Failsafe Activated!")
                     self.A = 0
                     self.B = 0
-                    self.shared.set_AB([self.A, self.B])
+                    self.shared.set_applied_AB(self.A, self.B)
                     self.bladder = BLADDER_NEUTRAL_POSITION
-                    self.shared.set_mode(None)
+                    self.shared.set_mode(None) 
+                    self.last_pc_apply_time = None
                 else:
                     if channels[0] != 0:
                         if not Servos_power_switch.is_active: Servos_power_switch.on()
                         # print("Transmitter Connected")
                         self.channels = channels_2_dir(channels)
+                        now = monotonic()
+
+                        # PC mode
                         if self.channels[2] > 0:
-                            # self.A, self.B = self.shared.get_AB()
-                            # self.shared.set_mode('PC')
-                            self.A = self.channels[0]/20
-                            self.B = self.channels[1]/20
                             self.shared.set_mode('PC')
-                            self.shared.set_AB([self.A, self.B]) # 여기 조심!!!!!!!!!!!!!!!!! Logging을 위한 PC mode 개조
-                        else:
-                            self.A = self.channels[0]/20
-                            self.B = self.channels[1]/20
-                            self.shared.set_mode('RC')
-                            self.shared.set_AB([self.A, self.B])
+                            if (self.last_pc_apply_time is None or
+                            (now - self.last_pc_apply_time) >= PC_CONTROL_UPDATE_INTERVAL):
+                                self.A = abs(self.channels[0]) / 20
+                                self.B = self.channels[1] / 20
+                                self.shared.set_applied_AB(self.A, self.B)
+                                self.last_pc_apply_time = now # 여기 조심!!!!!!!!!!!!!!!!! Logging을 위한 PC mode 개조
                         
+                        # RC mode
+                        else:
+                            self.A = abs(self.channels[0]) / 20
+                            self.B = self.channels[1] / 20
+                            self.shared.set_mode('RC')
+                            self.shared.set_applied_AB(self.A, self.B)
+                            self.last_pc_apply_time = None
+                        
+                        # Bladder
                         if self.channels[3] > 0:
                             self.bladder = self.pitch_control()
                             # print(f'Auto control mode: Bladder {self.bladder}')
