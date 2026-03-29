@@ -32,7 +32,7 @@ TARGET_PITCH = 0.0
 
 TAIL_SERVO_PERIOD = 8
 FISH_STATE_TIMEOUT_SEC = 0.2  # /Fish_state가 이 시간 이상 끊기면 /Fish_data 중단
-PC_CONTROL_UPDATE_INTERVAL = 1.0
+PC_STEPS_PER_COMMAND = 20
 
 Servos_power_switch = OutputDevice(SERVOS_POWER_PIN)
 
@@ -263,7 +263,14 @@ class Servo:
 
         self.last_pitch_error = 0.0
         self.last_time = None
-        self.last_pc_apply_time = None
+        
+        # PC mode: latest requested command, to be applied only on servo tick block boundary
+        self.pending_A = 0.0
+        self.pending_B = 0.0
+        self._cmd_lock = threading.Lock()
+
+        # Counts how many servo/log ticks the current PC command has already lasted
+        self.pc_step_count = 0
 
     def update_command(self):
         next_tick = monotonic()
@@ -282,26 +289,25 @@ class Servo:
                     # print("Transmitter Connection LOST - Failsafe Activated!")
                     self.A = 0
                     self.B = 0
+                    with self._cmd_lock:
+                        self.pending_A = 0.0
+                        self.pending_B = 0.0
                     self.shared.set_applied_AB(self.A, self.B)
                     self.bladder = BLADDER_NEUTRAL_POSITION
                     self.shared.set_mode(None) 
-                    self.last_pc_apply_time = None
+    
                 else:
                     if channels[0] != 0:
                         if not Servos_power_switch.is_active: Servos_power_switch.on()
                         # print("Transmitter Connected")
                         self.channels = channels_2_dir(channels)
-                        now = monotonic()
 
                         # PC mode
                         if self.channels[2] > 0:
+                            with self._cmd_lock:
+                                self.pending_A = abs(self.channels[0]) / 20
+                                self.pending_B = self.channels[1] / 20 # 여기 조심!!!!!!!!!!!!!!!!! Logging을 위한 PC mode 개조
                             self.shared.set_mode('PC')
-                            if (self.last_pc_apply_time is None or
-                            (now - self.last_pc_apply_time) >= PC_CONTROL_UPDATE_INTERVAL):
-                                self.A = abs(self.channels[0]) / 20
-                                self.B = self.channels[1] / 20
-                                self.shared.set_applied_AB(self.A, self.B)
-                                self.last_pc_apply_time = now # 여기 조심!!!!!!!!!!!!!!!!! Logging을 위한 PC mode 개조
                         
                         # RC mode
                         else:
@@ -309,7 +315,6 @@ class Servo:
                             self.B = self.channels[1] / 20
                             self.shared.set_mode('RC')
                             self.shared.set_applied_AB(self.A, self.B)
-                            self.last_pc_apply_time = None
                         
                         # Bladder
                         if self.channels[3] > 0:
@@ -332,11 +337,31 @@ class Servo:
         next_tick = monotonic()
         while self.running:
             next_tick += SERVO_UPDATE_RATE
+
             if self.shared.get_mode() == 'PC':
+                if self.pc_step_count == 0:
+                    with self._cmd_lock:
+                        self.A = self.pending_A
+                        self.B = self.pending_B
+                    self.shared.set_applied_AB(self.A, self.B)
+
+                # Apply current A,B to the servos for this tick
+                self.servo0.value = next(self.servo0_CPG)
+                self.servo1.value = next(self.servo1_CPG)
+                self.servo2.value = next(self.servo2_CPG)
+
+                # Log the same A,B that were applied on this tick
                 self.shared.publish_data()
-            self.servo0.value = next(self.servo0_CPG)
-            self.servo1.value = next(self.servo1_CPG)
-            self.servo2.value = next(self.servo2_CPG)
+
+                self.pc_step_count += 1
+                if self.pc_step_count >= PC_STEPS_PER_COMMAND:
+                    self.pc_step_count = 0
+            
+            else:
+                self.pc_step_count = 0
+                self.servo0.value = next(self.servo0_CPG)
+                self.servo1.value = next(self.servo1_CPG)
+                self.servo2.value = next(self.servo2_CPG)
 
             sleep_time = next_tick - monotonic()
             if sleep_time > 0:
