@@ -32,7 +32,7 @@ TARGET_PITCH = 0.0
 
 TAIL_SERVO_PERIOD = 8
 FISH_STATE_TIMEOUT_SEC = 0.2  # /Fish_state가 이 시간 이상 끊기면 /Fish_data 중단
-PC_STEPS_PER_COMMAND = 20
+PC_STEPS_PER_COMMAND = 0
 
 Servos_power_switch = OutputDevice(SERVOS_POWER_PIN)
 
@@ -97,7 +97,7 @@ class ServoTarget:
         self.applied_B = 0.0
 
         self.pitch = 0.0
-        self.state = [0.0]*6
+        self.state = [0.0]*13
         self.mode = None
         self.pub_data = None
         self._last_state_walltime = None
@@ -121,8 +121,8 @@ class ServoTarget:
             return self.applied_A, self.applied_B
 
     def set_state(self, arr):
-        # arr: [x, y, z, roll, pitch, yaw]
-        if not arr or len(arr) != 6:
+        # arr: [x, y, z, roll, pitch, yaw, joint, u, v, r, joint_rate, body_age, joint_age]
+        if not arr or len(arr) != 13:
             return
         with self._lock:
             self.state = list(arr)
