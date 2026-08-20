@@ -95,6 +95,7 @@ class ServoTarget:
         # Actual applied to the servo
         self.applied_A = 0.0
         self.applied_B = 0.0
+        self.cpg_phase = 0.0
 
         self.pitch = 0.0
         self.state = [0.0]*13
@@ -119,6 +120,10 @@ class ServoTarget:
     def get_applied_AB(self):
         with self._lock:
             return self.applied_A, self.applied_B
+    
+    def set_cpg_phase(self, phase):
+        with self._lock:
+            self.cpg_phase = float(phase)
 
     def set_state(self, arr):
         # arr: [x, y, z, roll, pitch, yaw, joint, u, v, r, joint_rate, body_age, joint_age]
@@ -159,6 +164,7 @@ class ServoTarget:
         with self._lock:
             A = self.applied_A
             B = self.applied_B
+            phase = self.cpg_phase
             mode = self.mode
             state = self.state
         
@@ -171,7 +177,7 @@ class ServoTarget:
             mode_val = -1.0
         
         msg = Float64MultiArray()
-        msg.data = [rospy.get_time()] + state + [A, B, mode_val]
+        msg.data = [rospy.get_time()] + state + [A, B, phase]
 
         self.pub_data.publish(msg)
 
@@ -347,8 +353,11 @@ class Servo:
 
                 # Apply current A,B to the servos for this tick
                 self.servo0.value = next(self.servo0_CPG)
-                self.servo1.value = next(self.servo1_CPG)
-                self.servo2.value = next(self.servo2_CPG)
+                self.servo1.value, phase = next(self.servo1_CPG)
+                self.servo2.value, _ = next(self.servo2_CPG)
+
+                # Get CPG phase while phase1 == phase2
+                self.shared.set_cpg_phase(phase)
 
                 # Log the same A,B that were applied on this tick
                 self.shared.publish_data()
@@ -360,8 +369,8 @@ class Servo:
             else:
                 self.pc_step_count = 0
                 self.servo0.value = next(self.servo0_CPG)
-                self.servo1.value = next(self.servo1_CPG)
-                self.servo2.value = next(self.servo2_CPG)
+                self.servo1.value, phase = next(self.servo1_CPG)
+                self.servo2.value, _ = next(self.servo2_CPG)
 
             sleep_time = next_tick - monotonic()
             if sleep_time > 0:
@@ -381,7 +390,8 @@ class Servo:
     def sin_values(self, phase_lag):
         angles = (2 * pi * i / self.period for i in range(self.period))
         for angle in cycle(angles):
-            yield max(-0.99, min(self.A*sin(angle - phase_lag) - self.B, 0.99))
+            servo_value = max(-1, min(self.A*sin(angle - phase_lag) - self.B, 1))
+            yield servo_value, angle
     
     def bladder_values(self):
         while True:
