@@ -8,8 +8,7 @@ Device.pin_factory = PiGPIOFactory()
 
 ##### Taken from gpiozero source #####
 from time import sleep, monotonic
-from itertools import cycle
-from math import sin, cos, pi
+from math import sin, pi, isfinite
 
 import rospy
 from std_msgs.msg import Float64MultiArray
@@ -32,7 +31,10 @@ TARGET_PITCH = 0.0
 
 TAIL_SERVO_PERIOD = 8
 FISH_STATE_TIMEOUT_SEC = 0.2  # /Fish_state가 이 시간 이상 끊기면 /Fish_data 중단
-PC_STEPS_PER_COMMAND = 0
+MPC_RESPONSE_TIMEOUT_SEC = 0.045
+MPC_AMPLITUDE_MIN = 0.2
+MPC_AMPLITUDE_MAX = 0.5
+MPC_OFFSET_MAX = 0.5
 
 Servos_power_switch = OutputDevice(SERVOS_POWER_PIN)
 
@@ -87,10 +89,15 @@ def parsePacket(packet):
 
 class ServoTarget:
     def __init__(self):
-        self._lock = threading.Lock()
-        # Command from the RC controller
+        self._lock = threading.RLock()
+        self._cmd_condition = threading.Condition(self._lock)
+
+        # Most recent response from the MPC controller
         self.cmd_A = 0.0
         self.cmd_B = 0.0
+        self.cmd_request_id = None
+        self.cmd_received_time = None
+        self.active_request_id = None
 
         # Actual applied to the servo
         self.applied_A = 0.0
@@ -101,16 +108,93 @@ class ServoTarget:
         self.state = [0.0]*13
         self.mode = None
         self.pub_data = None
+        self.pub_feedback = None
         self._last_state_walltime = None
 
     def set_cmd_AB(self, arr):
-        with self._lock:
-            if len(arr) >= 1: self.cmd_A = float(arr[0])
-            if len(arr) >= 2: self.cmd_B = float(arr[1])
+        if len(arr) != 3:
+            return False
+
+        try:
+            A = float(arr[0])
+            B = float(arr[1])
+            raw_request_id = float(arr[2])
+        except (TypeError, ValueError):
+            return False
+
+        request_id = int(round(raw_request_id))
+        if (
+            not isfinite(A)
+            or not isfinite(B)
+            or not isfinite(raw_request_id)
+            or request_id < 0
+            or abs(raw_request_id - request_id) > 1e-6
+            or A < MPC_AMPLITUDE_MIN - 1e-3
+            or A > MPC_AMPLITUDE_MAX + 1e-3
+            or abs(B) > MPC_OFFSET_MAX + 1e-3
+        ):
+            return False
+
+        received_time = monotonic()
+        with self._cmd_condition:
+            # An unsolicited, duplicate, timed-out, or otherwise stale response
+            # must never be reused for a later servo phase.
+            if self.active_request_id != request_id:
+                return False
+            if self.cmd_request_id == request_id:
+                return False
+            self.cmd_A = A
+            self.cmd_B = B
+            self.cmd_request_id = request_id
+            self.cmd_received_time = received_time
+            self._cmd_condition.notify_all()
+        return True
 
     def get_cmd_AB(self):
         with self._lock:
             return self.cmd_A, self.cmd_B
+
+    def begin_command_request(self, request_id):
+        request_id = int(request_id)
+        with self._cmd_condition:
+            self.active_request_id = request_id
+            self.cmd_request_id = None
+            self.cmd_received_time = None
+
+    def cancel_command_request(self, request_id):
+        request_id = int(request_id)
+        with self._cmd_condition:
+            if self.active_request_id == request_id:
+                self.active_request_id = None
+                self._cmd_condition.notify_all()
+
+    def wait_for_command(self, request_id, request_start, timeout):
+        request_id = int(request_id)
+        request_start = float(request_start)
+        deadline = request_start + float(timeout)
+
+        with self._cmd_condition:
+            while True:
+                if self.mode != 'PC':
+                    if self.active_request_id == request_id:
+                        self.active_request_id = None
+                    return None, 'cancelled', monotonic() - request_start
+
+                if self.cmd_request_id == request_id:
+                    gait = (self.cmd_A, self.cmd_B)
+                    received_time = self.cmd_received_time
+                    self.active_request_id = None
+                    if received_time <= deadline:
+                        return gait, 'received', received_time - request_start
+                    return None, 'timeout', monotonic() - request_start
+
+                remaining = deadline - monotonic()
+                if remaining <= 0.0:
+                    if self.active_request_id == request_id:
+                        self.active_request_id = None
+                    return None, 'timeout', monotonic() - request_start
+
+                self._cmd_condition.wait(remaining)
     
     def set_applied_AB(self, A, B):
         with self._lock:
@@ -127,16 +211,45 @@ class ServoTarget:
 
     def set_state(self, arr):
         # arr: [x, y, z, roll, pitch, yaw, joint, u, v, r, joint_rate, body_age, joint_age]
-        if not arr or len(arr) != 13:
-            return
+        if arr is None or len(arr) != 13:
+            return False
+        try:
+            state = [float(value) for value in arr]
+        except (TypeError, ValueError):
+            return False
+        if not all(isfinite(value) for value in state):
+            return False
         with self._lock:
-            self.state = list(arr)
-            self.pitch = float(arr[4])
+            self.state = state
+            self.pitch = state[4]
             self._last_state_walltime = monotonic()
+        return True
     
     def get_state(self):
         with self._lock:
-            return self.state
+            return list(self.state)
+
+    def get_control_state(self):
+        """Return the latest eight-value MPC state in the ROS message units."""
+
+        with self._lock:
+            if not self._state_is_fresh():
+                return None
+            state = list(self.state)
+
+        # /Fish_state:
+        # [x, y, z, roll, pitch, yaw, alpha, u, v, r, alpha_dot,
+        #  body_age, joint_age]
+        return [
+            state[0],   # x [m]
+            state[1],   # y [m]
+            state[5],   # psi [deg]
+            state[6],   # alpha [deg]
+            state[7],   # u [m/s]
+            state[8],   # v [m/s]
+            state[9],   # r [deg/s]
+            state[10],  # alpha_dot [deg/s]
+        ]
     
     def _state_is_fresh(self, timeout=FISH_STATE_TIMEOUT_SEC):
         t = self._last_state_walltime
@@ -147,39 +260,49 @@ class ServoTarget:
             return self.pitch
     
     def set_mode(self, mode):
-        with self._lock:
-            self.mode = mode
+        with self._cmd_condition:
+            if self.mode != mode:
+                self.mode = mode
+                self._cmd_condition.notify_all()
     
     def get_mode(self):
         with self._lock:
             return self.mode
     
-    def publish_data(self):
-        if self.pub_data is None:
-            return
-        
-        if not self._state_is_fresh():
-            return
-
-        with self._lock:
-            A = self.applied_A
-            B = self.applied_B
-            phase = self.cpg_phase
-            mode = self.mode
-            state = self.state
-        
-        # RC=1.0, PC=0.0, Failsafe=-1.0
-        if mode == 'RC':
-            mode_val = 1.0
-        elif mode == 'PC':
-            mode_val = 0.0
-        else:
-            mode_val = -1.0
-        
+    @staticmethod
+    def _message(values):
         msg = Float64MultiArray()
-        msg.data = [rospy.get_time()] + state + [A, B, phase]
+        msg.data = [float(value) for value in values]
+        return msg
 
-        self.pub_data.publish(msg)
+    def publish_feedback(self, control_state, target_phase, request_id):
+        if self.pub_feedback is None:
+            return False
+
+        values = list(control_state) + [float(target_phase), float(request_id)]
+        self.pub_feedback.publish(self._message(values))
+        return True
+
+    def publish_data(
+        self,
+        timestamp,
+        control_state,
+        applied_A,
+        applied_B,
+        applied_phase,
+        mpc_solvingtime,
+    ):
+        if self.pub_data is None:
+            return False
+
+        values = [float(timestamp)] + list(control_state) + [
+            float(applied_A),
+            float(applied_B),
+            float(applied_phase),
+            float(mpc_solvingtime),
+        ]
+        self.pub_data.publish(self._message(values))
+        return True
 
 
 class ROS_Bringup:
@@ -202,7 +325,10 @@ class ROS_Bringup:
             print("No Msg Data (/Fish_state)")
             return
         
-        self.shared.set_state(msg.data)
+        if not self.shared.set_state(msg.data):
+            rospy.logwarn_throttle(
+                1.0, "Rejected /Fish_state: expected 13 finite numeric values."
+            )
 
     def _wait_and_init(self):
         backoff = 2
@@ -215,11 +341,36 @@ class ROS_Bringup:
                     if not rospy.core.is_initialized():
                         raise RuntimeError("rospy not initialized after init_node")
 
-                    sub_cmd = rospy.Subscriber("/cmd/servo", Float64MultiArray, self._cmd_callback, queue_size=10)
-                    sub_state = rospy.Subscriber("/Fish_state", Float64MultiArray, self._state_callback, queue_size=10)
-                    pub_data = rospy.Publisher("/Fish_data", Float64MultiArray, queue_size=10)
+                    sub_cmd = rospy.Subscriber(
+                        "/cmd/servo",
+                        Float64MultiArray,
+                        self._cmd_callback,
+                        queue_size=1,
+                        tcp_nodelay=True,
+                    )
+                    sub_state = rospy.Subscriber(
+                        "/Fish_state",
+                        Float64MultiArray,
+                        self._state_callback,
+                        queue_size=1,
+                        tcp_nodelay=True,
+                    )
+                    pub_feedback = rospy.Publisher(
+                        "/Fish_feedback",
+                        Float64MultiArray,
+                        queue_size=1,
+                        tcp_nodelay=True,
+                    )
+                    pub_data = rospy.Publisher(
+                        "/Fish_data", Float64MultiArray, queue_size=10
+                    )
+                    self.shared.pub_feedback = pub_feedback
                     self.shared.pub_data = pub_data
-                    rospy.loginfo("ROS is up. Subscribed to /cmd/servo and /Fish_state (std_msgs/Float64MultiArray).")
+                    self.ready.set()
+                    rospy.loginfo(
+                        "ROS is up. /Fish_state -> /Fish_feedback -> "
+                        "/cmd/servo; logging /Fish_data."
+                    )
 
                     while not rospy.is_shutdown():
                         sleep(0.1)
@@ -233,8 +384,10 @@ class ROS_Bringup:
 
 class Servo:
     def __init__(self, shared_targets: ServoTarget):
-        self.A = 0
-        self.B = 0
+        self.applied_A = 0.0
+        self.applied_B = 0.0
+        self.rc_A = 0.0
+        self.rc_B = 0.0
         self.bladder = BLADDER_NEUTRAL_POSITION
         self.K_p, self.K_i, self.K_d = BLADDER_CONTROL_GAIN
         self.period = TAIL_SERVO_PERIOD
@@ -247,11 +400,9 @@ class Servo:
 
         # Servo 1 : Neutral at 1475us, 10deg / 100us
         self.servo1 = AngularServo(SERVO_GPIO_PIN_1, min_angle=-50, max_angle=50, min_pulse_width=0.000975, max_pulse_width=0.001975)
-        self.servo1_CPG = self.sin_values(phase_lag=0)
 
         # Servo 2 : Neutral at 1400us, 10deg / 100us
         self.servo2 = AngularServo(SERVO_GPIO_PIN_2, min_angle=-50, max_angle=50, min_pulse_width=0.0009, max_pulse_width=0.0019)
-        self.servo2_CPG = self.sin_values(phase_lag=0)
 
         self.context = zmq.Context()
         self.rf_socket = self.context.socket(zmq.SUB)
@@ -269,14 +420,27 @@ class Servo:
 
         self.last_pitch_error = 0.0
         self.last_time = None
-        
-        # PC mode: latest requested command, to be applied only on servo tick block boundary
-        self.pending_A = 0.0
-        self.pending_B = 0.0
-        self._cmd_lock = threading.Lock()
+        self._command_lock = threading.Lock()
+        self.phase_index = 0
+        self.request_id = 0
 
-        # Counts how many servo/log ticks the current PC command has already lasted
-        self.pc_step_count = 0
+    def _set_applied_tail_gait(self, A, B):
+        with self._command_lock:
+            self.applied_A = float(A)
+            self.applied_B = float(B)
+
+    def _get_applied_tail_gait(self):
+        with self._command_lock:
+            return self.applied_A, self.applied_B
+
+    def _set_rc_gait(self, A, B):
+        with self._command_lock:
+            self.rc_A = float(A)
+            self.rc_B = float(B)
+
+    def _get_rc_gait(self):
+        with self._command_lock:
+            return self.rc_A, self.rc_B
 
     def update_command(self):
         next_tick = monotonic()
@@ -293,12 +457,8 @@ class Servo:
                 if failsafe and Servos_power_switch.is_active: Servos_power_switch.off()
                 if failsafe or frame_lost:
                     # print("Transmitter Connection LOST - Failsafe Activated!")
-                    self.A = 0
-                    self.B = 0
-                    with self._cmd_lock:
-                        self.pending_A = 0.0
-                        self.pending_B = 0.0
-                    self.shared.set_applied_AB(self.A, self.B)
+                    self._set_rc_gait(0.0, 0.0)
+                    self.shared.set_applied_AB(0.0, 0.0)
                     self.bladder = BLADDER_NEUTRAL_POSITION
                     self.shared.set_mode(None) 
     
@@ -310,17 +470,15 @@ class Servo:
 
                         # PC mode
                         if self.channels[2] > 0:
-                            with self._cmd_lock:
-                                self.pending_A = abs(self.channels[0]) / 20
-                                self.pending_B = self.channels[1] / 20 # 여기 조심!!!!!!!!!!!!!!!!! Logging을 위한 PC mode 개조
                             self.shared.set_mode('PC')
                         
                         # RC mode
                         else:
-                            self.A = abs(self.channels[0]) / 20
-                            self.B = self.channels[1] / 20
+                            A = abs(self.channels[0]) / 20
+                            B = self.channels[1] / 20
+                            self._set_rc_gait(A, B)
                             self.shared.set_mode('RC')
-                            self.shared.set_applied_AB(self.A, self.B)
+                            self.shared.set_applied_AB(A, B)
                         
                         # Bladder
                         if self.channels[3] > 0:
@@ -344,33 +502,86 @@ class Servo:
         while self.running:
             next_tick += SERVO_UPDATE_RATE
 
+            phase = 2.0 * pi * self.phase_index / self.period
+            feedback_state = None
+            feedback_timestamp = None
+            mpc_solvingtime = None
+            request_status = None
+            response_gait = None
+
             if self.shared.get_mode() == 'PC':
-                if self.pc_step_count == 0:
-                    with self._cmd_lock:
-                        self.A = self.pending_A
-                        self.B = self.pending_B
-                    self.shared.set_applied_AB(self.A, self.B)
+                feedback_state = self.shared.get_control_state()
+                if feedback_state is not None:
+                    self.request_id += 1
+                    request_id = self.request_id
+                    self.shared.begin_command_request(request_id)
 
-                # Apply current A,B to the servos for this tick
-                self.servo0.value = next(self.servo0_CPG)
-                self.servo1.value, phase = next(self.servo1_CPG)
-                self.servo2.value, _ = next(self.servo2_CPG)
+                    # Round-trip timing starts immediately before publishing the
+                    # request and ends in the matching /cmd/servo callback.
+                    feedback_timestamp = rospy.get_time()
+                    request_start = monotonic()
+                    published = self.shared.publish_feedback(
+                        feedback_state, phase, request_id
+                    )
+                    if published:
+                        gait, request_status, mpc_solvingtime = (
+                            self.shared.wait_for_command(
+                                request_id,
+                                request_start,
+                                MPC_RESPONSE_TIMEOUT_SEC,
+                            )
+                        )
+                    else:
+                        self.shared.cancel_command_request(request_id)
+                        gait = None
+                        request_status = 'timeout'
+                        mpc_solvingtime = MPC_RESPONSE_TIMEOUT_SEC
 
-                # Get CPG phase while phase1 == phase2
-                self.shared.set_cpg_phase(phase)
+                    if request_status == 'received':
+                        response_gait = gait
+                    elif request_status == 'timeout':
+                        # Keep the gait that was applied on the preceding tick.
+                        rospy.logwarn_throttle(
+                            1.0,
+                            "MPC response exceeded %.1f ms; reusing previous gait.",
+                            1000.0 * MPC_RESPONSE_TIMEOUT_SEC,
+                        )
 
-                # Log the same A,B that were applied on this tick
-                self.shared.publish_data()
-
-                self.pc_step_count += 1
-                if self.pc_step_count >= PC_STEPS_PER_COMMAND:
-                    self.pc_step_count = 0
-            
+            # The RF thread can switch to RC/failsafe while this thread waits.
+            # Re-read the mode so that the operator always takes precedence.
+            mode = self.shared.get_mode()
+            if mode == 'PC' and response_gait is not None:
+                A, B = response_gait
+            elif mode == 'RC':
+                A, B = self._get_rc_gait()
+            elif mode == 'PC':
+                A, B = self._get_applied_tail_gait()
             else:
-                self.pc_step_count = 0
-                self.servo0.value = next(self.servo0_CPG)
-                self.servo1.value, phase = next(self.servo1_CPG)
-                self.servo2.value, _ = next(self.servo2_CPG)
+                A, B = 0.0, 0.0
+            self._set_applied_tail_gait(A, B)
+            self.shared.set_applied_AB(A, B)
+            self.shared.set_cpg_phase(phase)
+
+            self.servo0.value = next(self.servo0_CPG)
+            tail_value = self.tail_value(A, B, phase)
+            self.servo1.value = tail_value
+            self.servo2.value = tail_value
+
+            if (
+                mode == 'PC'
+                and request_status in ('received', 'timeout')
+                and feedback_state is not None
+            ):
+                self.shared.publish_data(
+                    feedback_timestamp,
+                    feedback_state,
+                    A,
+                    B,
+                    phase,
+                    mpc_solvingtime,
+                )
+
+            self.phase_index = (self.phase_index + 1) % self.period
 
             sleep_time = next_tick - monotonic()
             if sleep_time > 0:
@@ -383,15 +594,16 @@ class Servo:
         self.servo_thread.start()
 
     def stop(self):
+        if not self.running:
+            return
         self.running = False
+        self.shared.set_mode(None)
         self.rf_thread.join()
         self.servo_thread.join()
 
-    def sin_values(self, phase_lag):
-        angles = (2 * pi * i / self.period for i in range(self.period))
-        for angle in cycle(angles):
-            servo_value = max(-1, min(self.A*sin(angle - phase_lag) - self.B, 1))
-            yield servo_value, angle
+    @staticmethod
+    def tail_value(A, B, phase, phase_lag=0.0):
+        return max(-1.0, min(A * sin(phase - phase_lag) - B, 1.0))
     
     def bladder_values(self):
         while True:
