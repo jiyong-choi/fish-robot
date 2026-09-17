@@ -32,9 +32,6 @@ TARGET_PITCH = 0.0
 TAIL_SERVO_PERIOD = 8
 FISH_STATE_TIMEOUT_SEC = 0.2  # /Fish_state가 이 시간 이상 끊기면 /Fish_data 중단
 MPC_RESPONSE_TIMEOUT_SEC = 0.045
-MPC_AMPLITUDE_MIN = 0.2
-MPC_AMPLITUDE_MAX = 0.5
-MPC_OFFSET_MAX = 0.5
 
 Servos_power_switch = OutputDevice(SERVOS_POWER_PIN)
 
@@ -129,9 +126,6 @@ class ServoTarget:
             or not isfinite(raw_request_id)
             or request_id < 0
             or abs(raw_request_id - request_id) > 1e-6
-            or A < MPC_AMPLITUDE_MIN - 1e-3
-            or A > MPC_AMPLITUDE_MAX + 1e-3
-            or abs(B) > MPC_OFFSET_MAX + 1e-3
         ):
             return False
 
